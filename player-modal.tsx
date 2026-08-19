@@ -1,625 +1,941 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
-import Image from "next/image";
-import { useRouter } from "next/navigation";
-import { useSafeSession } from "@/lib/use-safe-session";
+import { useEffect, useState, useMemo, useRef, useCallback } from "react";
+import Hls from "hls.js";
+import { X, AlertCircle, Loader2, Settings, Volume2, Server } from "lucide-react";
 import {
-  Play, X, Star, Calendar, Clock, Loader2, Bookmark, Check, Share2,
-  MessageSquare, Send, Trash2, CornerDownRight, ChevronLeft, ChevronRight,
-  User as UserIcon,
-} from "lucide-react";
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+  Dialog,
+  DialogContent,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useAppStore } from "@/lib/store";
-import { getImageUrl, type MovieDetail } from "@/lib/tmdb";
-import { MovieCard } from "./movie-card";
-import { toast } from "sonner";
 
-interface UserRating { id: string; rating: number; review: string | null; }
-interface RatingItem { id: string; rating: number; review: string | null; createdAt: string; userId: string; name: string | null; image: string | null; }
-interface CommentItem { id: string; userId: string; mediaId: number; mediaType: string; content: string; parentId: string | null; createdAt: string; updatedAt: string; userName: string | null; userImage: string | null; replies: CommentItem[]; }
-interface Episode { episodeNumber: number; name: string; overview: string; stillPath: string | null; airDate: string; runtime: number | null; }
+const VPS_API_BASE =
+  process.env.NEXT_PUBLIC_API_URL || "https://api.cinestream.my.id";
 
-export function DetailModal() {
-  const { selectedMedia, setSelectedMedia, openPlayer, addToHistory, setAuthModalOpen } = useAppStore();
-  const { data: session, status } = useSafeSession();
-  const router = useRouter();
+const SWITCHING_TIMEOUT_MS = 12000;
 
-  const handlePersonClick = (personId: number) => {
-    if (selectedMedia) {
-      router.push(`/person/${personId}?return=${selectedMedia.type}=${selectedMedia.id}`);
-    } else {
-      router.push(`/person/${personId}`);
-    }
-    setSelectedMedia(null);
+interface ServerInfo {
+  id: number;
+  title: string;
+  stream_url: string;
+}
+
+interface StreamInfo {
+  content: {
+    id: number;
+    cinemacity_id: string;
+    title: string;
+    type: string;
   };
-  const [detail, setDetail] = useState<MovieDetail | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [inWatchlist, setInWatchlist] = useState(false);
-  const [watchlistLoading, setWatchlistLoading] = useState(false);
-  const [ratings, setRatings] = useState<RatingItem[]>([]);
-  const [userRating, setUserRating] = useState<UserRating | null>(null);
-  const [hoverRating, setHoverRating] = useState(0);
-  const [ratingLoading, setRatingLoading] = useState(false);
-  const [comments, setComments] = useState<CommentItem[]>([]);
-  const [commentText, setCommentText] = useState("");
-  const [commentLoading, setCommentLoading] = useState(false);
-  const [replyTo, setReplyTo] = useState<string | null>(null);
-  const [replyText, setReplyText] = useState("");
-  const [season, setSeason] = useState(1);
-  const [episode, setEpisode] = useState(1);
-  const [episodes, setEpisodes] = useState<Episode[]>([]);
-  const [episodesLoading, setEpisodesLoading] = useState(false);
+  stream_url: string;
+  servers: ServerInfo[];
+  episodes: {
+    season: number;
+    episode: number;
+    title: string;
+    stream_url: string;
+  }[];
+  subtitles: {
+    name: string;
+    url: string;
+  }[];
+  expires_at: string;
+}
+
+// FIX B: Subtitle source - bisa dari manual (admin upload) atau dari cinemacity
+interface SubtitleTrack {
+  name: string;
+  url: string;        // Full URL ke subtitle proxy
+  isManual: boolean;  // true kalau dari admin upload
+  isIndo: boolean;
+}
+
+async function findCinemacityContent(
+  media: any
+): Promise<{ cinemacity_id: string; slug: string; type: string } | null> {
+  if (media.cinemacityId || media.cinemacity_id) {
+    return {
+      cinemacity_id: String(media.cinemacityId || media.cinemacity_id),
+      slug: media.slug || "",
+      type: media.type === "tv" ? "tv" : "movie",
+    };
+  }
+
+  try {
+    const res = await fetch(
+      `${VPS_API_BASE}/api/search?q=${encodeURIComponent(media.title || "")}`
+    );
+    const data = await res.json();
+    if (data.success && data.data?.results?.length > 0) {
+      const titleLower = (media.title || "").toLowerCase();
+      const match =
+        data.data.results.find(
+          (r: any) => r.title.toLowerCase() === titleLower
+        ) ||
+        data.data.results.find((r: any) =>
+          r.title.toLowerCase().includes(titleLower)
+        );
+      if (match) {
+        return {
+          cinemacity_id: String(match.cinemacity_id),
+          slug: match.slug,
+          type: match.type,
+        };
+      }
+    }
+  } catch (e) {
+    console.error("Search VPS failed:", e);
+  }
+  return null;
+}
+
+async function getStreamInfo(
+  cinemacityId: string,
+  season?: string,
+  episode?: string
+): Promise<StreamInfo> {
+  const params = new URLSearchParams();
+  if (season) params.set("season", season);
+  if (episode) params.set("episode", episode);
+  const query = params.toString();
+  const url = `${VPS_API_BASE}/api/stream/info/${cinemacityId}${query ? "?" + query : ""}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  if (!data.success)
+    throw new Error(data.error || "Failed to get stream info");
+  return data.data;
+}
+
+// FIX B: Check manual subtitle di /api/subtitle/manual
+// Return null kalau tidak ada, return SubtitleTrack kalau ada
+async function checkManualSubtitle(
+  title: string,
+  type: string,
+  season?: string,
+  episode?: string
+): Promise<SubtitleTrack | null> {
+  try {
+    const params = new URLSearchParams({
+      title,
+      type,
+      format: "vtt",
+    });
+    if (season) params.set("season", season);
+    if (episode) params.set("episode", episode);
+
+    const url = `/api/subtitle/manual?${params.toString()}`;
+    const res = await fetch(url, { method: "HEAD" });
+    if (res.ok) {
+      // Cek header X-Subtitle-Source untuk konfirmasi
+      const source = res.headers.get("X-Subtitle-Source");
+      if (source === "manual") {
+        return {
+          name: "Indonesia (Manual)",
+          url: url,
+          isManual: true,
+          isIndo: true,
+        };
+      }
+    }
+    return null;
+  } catch (e) {
+    console.error("Check manual subtitle failed:", e);
+    return null;
+  }
+}
+
+interface VideoPlayerProps {
+  streamUrl: string;
+  subtitles: SubtitleTrack[];
+  defaultSubtitleIdx: number;
+  onSwitchingChange: (switching: boolean) => void;
+  onError: (msg: string) => void;
+}
+
+function VideoPlayer({
+  streamUrl,
+  subtitles,
+  defaultSubtitleIdx,
+  onSwitchingChange,
+  onError,
+}: VideoPlayerProps) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const hlsRef = useRef<Hls | null>(null);
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const subtitleTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const [audioTracks, setAudioTracks] = useState<Hls.AudioTrack[]>([]);
+  const [currentAudioTrack, setCurrentAudioTrack] = useState<number>(-1);
+  const [qualityLevels, setQualityLevels] = useState<Hls.Level[]>([]);
+  const [currentQuality, setCurrentQuality] = useState<number>(-1);
+  const [showSettings, setShowSettings] = useState(false);
+
+  const handleSwitchingDone = useCallback(() => {
+    onSwitchingChange(false);
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+  }, [onSwitchingChange]);
 
   useEffect(() => {
-    if (!selectedMedia) {
-      Promise.resolve().then(() => {
-        setDetail(null); setError(null); setInWatchlist(false);
-        setRatings([]); setUserRating(null); setComments([]);
-        setReplyTo(null); setReplyText(""); setCommentText("");
-        setSeason(1); setEpisode(1); setEpisodes([]);
+    const video = videoRef.current;
+    if (!video) return;
+
+    onSwitchingChange(true);
+
+    timeoutRef.current = setTimeout(() => {
+      console.error("[Player] Switching timeout");
+      onError("Loading terlalu lama. Coba server/episode lain atau refresh halaman.");
+      handleSwitchingDone();
+    }, SWITCHING_TIMEOUT_MS);
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        startLevel: -1,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
+        fragLoadingMaxRetry: 10,
+        fragLoadingRetryDelay: 1000,
+        manifestLoadingMaxRetry: 6,
+        manifestLoadingRetryDelay: 1000,
+        levelLoadingMaxRetry: 6,
+        levelLoadingRetryDelay: 1000,
       });
+
+      hlsRef.current = hls;
+      hls.loadSource(streamUrl);
+      hls.attachMedia(video);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        handleSwitchingDone();
+        video.play().catch(() => {});
+
+        setAudioTracks(hls.audioTracks || []);
+        const indoTrack = (hls.audioTracks || []).findIndex(
+          (t) =>
+            t.name?.toLowerCase().includes("indonesia") ||
+            t.lang?.toLowerCase().includes("id")
+        );
+        if (indoTrack >= 0) {
+          hls.audioTrack = indoTrack;
+          setCurrentAudioTrack(indoTrack);
+        }
+
+        setQualityLevels(hls.levels || []);
+        setCurrentQuality(-1);
+
+        if (defaultSubtitleIdx >= 0) {
+          const enableDefaultSub = () => {
+            const tracks = video.textTracks;
+            if (tracks && tracks.length > defaultSubtitleIdx) {
+              for (let i = 0; i < tracks.length; i++) {
+                tracks[i].mode = i === defaultSubtitleIdx ? "showing" : "disabled";
+              }
+            }
+          };
+          enableDefaultSub();
+          const t1 = setTimeout(enableDefaultSub, 500);
+          const t2 = setTimeout(enableDefaultSub, 1500);
+          subtitleTimersRef.current.push(t1, t2);
+        }
+      });
+
+      hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, () => {
+        setAudioTracks(hls.audioTracks || []);
+      });
+
+      hls.on(Hls.Events.LEVELS_UPDATED, () => {
+        setQualityLevels(hls.levels || []);
+      });
+
+      // FIX v2: Retry counter untuk fatal errors
+      let retryCount = 0;
+      const MAX_RETRIES = 3;
+
+      hls.on(Hls.Events.ERROR, (event, data) => {
+        if (!data.fatal) return;
+
+        retryCount++;
+        console.warn(`[Player] Fatal error #${retryCount}/${MAX_RETRIES}:`, data.type, data.details);
+
+        if (retryCount > MAX_RETRIES) {
+          handleSwitchingDone();
+          onError("Stream error setelah 3x retry. Coba server/episode lain atau refresh halaman.");
+          hls.destroy();
+          return;
+        }
+
+        // Set switching=true lagi saat retry
+        onSwitchingChange(true);
+
+        switch (data.type) {
+          case Hls.ErrorTypes.NETWORK_ERROR:
+            // Coba startLoad dulu
+            console.log("[Player] Network error, retrying with startLoad...");
+            hls.startLoad();
+            // Kalau masih gagal dalam 10 detik, destroy + recreate
+            timeoutRef.current = setTimeout(() => {
+              console.log("[Player] startLoad failed, recreating HLS instance...");
+              try {
+                hls.destroy();
+              } catch {}
+              // Recreate HLS instance
+              const newHls = new Hls({
+                enableWorker: true,
+                lowLatencyMode: false,
+                startLevel: -1,
+                maxBufferLength: 30,
+                maxMaxBufferLength: 60,
+                fragLoadingMaxRetry: 10,
+                fragLoadingRetryDelay: 1000,
+                manifestLoadingMaxRetry: 6,
+                manifestLoadingRetryDelay: 1000,
+                levelLoadingMaxRetry: 6,
+                levelLoadingRetryDelay: 1000,
+              });
+              hlsRef.current = newHls;
+              newHls.loadSource(streamUrl);
+              newHls.attachMedia(video);
+              // Re-register events for new instance
+              newHls.on(Hls.Events.MANIFEST_PARSED, () => {
+                handleSwitchingDone();
+                video.play().catch(() => {});
+              });
+              newHls.on(Hls.Events.ERROR, (evt2, data2) => {
+                if (data2.fatal) {
+                  retryCount++;
+                  if (retryCount > MAX_RETRIES) {
+                    handleSwitchingDone();
+                    onError("Stream error setelah retry. Coba server/episode lain.");
+                    newHls.destroy();
+                  } else {
+                    newHls.startLoad();
+                  }
+                }
+              });
+            }, 10000);
+            break;
+          case Hls.ErrorTypes.MEDIA_ERROR:
+            console.log("[Player] Media error, recovering...");
+            hls.recoverMediaError();
+            timeoutRef.current = setTimeout(() => {
+              handleSwitchingDone();
+            }, 5000);
+            break;
+          default:
+            handleSwitchingDone();
+            onError("Stream error. Coba server/episode lain.");
+            hls.destroy();
+            break;
+        }
+      });
+    }
+
+    return () => {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+      subtitleTimersRef.current.forEach((t) => clearTimeout(t));
+      subtitleTimersRef.current = [];
+
+      if (hlsRef.current) {
+        try {
+          hlsRef.current.destroy();
+        } catch (e) {
+          console.error("HLS destroy on unmount:", e);
+        }
+        hlsRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleAudioTrackChange = (trackId: string) => {
+    const idx = parseInt(trackId);
+    if (hlsRef.current) {
+      hlsRef.current.audioTrack = idx;
+      setCurrentAudioTrack(idx);
+    }
+  };
+
+  const handleQualityChange = (levelId: string) => {
+    const idx = parseInt(levelId);
+    if (hlsRef.current) {
+      hlsRef.current.currentLevel = idx;
+      setCurrentQuality(idx);
+    }
+  };
+
+  const hasSettings = audioTracks.length > 1 || qualityLevels.length > 1;
+
+  return (
+    <div className="relative aspect-video w-full bg-black">
+      <video
+        ref={videoRef}
+        className="h-full w-full"
+        controls
+        autoPlay
+        playsInline
+        referrerPolicy="no-referrer"
+      >
+        {subtitles.map((sub, idx) => {
+          const isDefault = idx === defaultSubtitleIdx;
+          return (
+            <track
+              key={`${sub.url}-${idx}`}
+              kind="subtitles"
+              src={sub.url}
+              srcLang={sub.isIndo ? "id" : "en"}
+              label={sub.name}
+              default={isDefault}
+            />
+          );
+        })}
+      </video>
+
+      {hasSettings && (
+        <div className="absolute right-12 top-2 z-30">
+          <button
+            onClick={() => setShowSettings(!showSettings)}
+            className="flex h-8 w-8 items-center justify-center rounded-full bg-black/50 text-white backdrop-blur-sm transition hover:bg-black/70"
+            aria-label="Settings"
+          >
+            <Settings className="h-4 w-4" />
+          </button>
+
+          {showSettings && (
+            <div className="absolute top-10 right-0 flex flex-col gap-2 rounded-lg bg-black/90 p-3 backdrop-blur-md">
+              {audioTracks.length > 1 && (
+                <div className="flex flex-col gap-1">
+                  <label className="flex items-center gap-1 text-[10px] text-white/60">
+                    <Volume2 className="h-3 w-3" /> Audio
+                  </label>
+                  <Select
+                    value={String(currentAudioTrack)}
+                    onValueChange={handleAudioTrackChange}
+                  >
+                    <SelectTrigger className="h-7 w-40 border-white/20 bg-zinc-900 text-xs text-white">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {audioTracks.map((track, idx) => (
+                        <SelectItem
+                          key={idx}
+                          value={String(idx)}
+                          className="text-xs"
+                        >
+                          {track.name || track.lang || `Track ${idx + 1}`}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
+
+              {qualityLevels.length > 1 && (
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] text-white/60">Quality</label>
+                  <Select
+                    value={String(currentQuality)}
+                    onValueChange={handleQualityChange}
+                  >
+                    <SelectTrigger className="h-7 w-40 border-white/20 bg-zinc-900 text-xs text-white">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="-1" className="text-xs">
+                        Auto
+                      </SelectItem>
+                      {qualityLevels.map((level, idx) => (
+                        <SelectItem
+                          key={idx}
+                          value={String(idx)}
+                          className="text-xs"
+                        >
+                          {level.height}p
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function PlayerModal() {
+  const {
+    playerMedia,
+    closePlayer,
+    addToHistory,
+    updateHistoryProgress,
+    history,
+  } = useAppStore();
+
+  const [loading, setLoading] = useState(true);
+  const [switching, setSwitching] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const [streamInfo, setStreamInfo] = useState<StreamInfo | null>(null);
+  const [cinemacityData, setCinemacityData] = useState<{
+    cinemacity_id: string;
+    slug: string;
+    type: string;
+  } | null>(null);
+
+  const [currentSeason, setCurrentSeason] = useState<string>("");
+  const [currentEpisode, setCurrentEpisode] = useState<string>("");
+  const [currentServer, setCurrentServer] = useState<string>("");
+
+  // FIX B: State untuk manual subtitle (dari admin upload)
+  const [manualSubtitle, setManualSubtitle] = useState<SubtitleTrack | null>(null);
+
+  // FIX: Counter untuk force remount VideoPlayer setiap kali player buka
+  // Tanpa ini, kalau user tutup player dan buka lagi film yang SAMA,
+  // streamUrl tidak berubah → VideoPlayer tidak remount → HLS instance lama stuck → loading forever
+  const [mountKey, setMountKey] = useState(0);
+
+  useEffect(() => {
+    if (!playerMedia) {
+      setStreamInfo(null);
+      setCinemacityData(null);
+      setError(null);
+      setLoading(false);
+      setCurrentServer("");
+      setManualSubtitle(null);
       return;
     }
+
+    // FIX: Increment mountKey setiap kali playerMedia berubah
+    setMountKey(prev => prev + 1);
+
     let cancelled = false;
-    const loadDetail = async () => {
-      await Promise.resolve();
-      if (cancelled) return;
-      setLoading(true); setError(null);
+
+    async function init() {
+      setLoading(true);
+      setError(null);
+
       try {
-        const res = await fetch(`/api/detail/${selectedMedia.id}?type=${selectedMedia.type}`);
-        if (!res.ok) throw new Error("Failed to load");
-        const data: MovieDetail = await res.json();
+        const ccData = await findCinemacityContent(playerMedia);
+        if (!ccData) {
+          throw new Error("Konten ini tidak tersedia di server streaming kami.");
+        }
+
         if (cancelled) return;
-        setDetail(data);
-      } catch (err) {
+        setCinemacityData(ccData);
+
+        const info = await getStreamInfo(ccData.cinemacity_id);
         if (cancelled) return;
-        setError(err instanceof Error ? err.message : "Unknown error");
+        setStreamInfo(info);
+
+        if (ccData.type === "tv" && info.episodes?.length > 0) {
+          const startSeason =
+            (playerMedia as any)._currentSeason ||
+            String(info.episodes[0].season);
+          const startEpisode =
+            (playerMedia as any)._currentEpisode ||
+            String(info.episodes[0].episode);
+          setCurrentSeason(startSeason);
+          setCurrentEpisode(startEpisode);
+        }
+
+        if (info.servers?.length > 1) {
+          setCurrentServer("0");
+        } else {
+          setCurrentServer("");
+        }
+
+        const existing = history.find((h) => h.id === playerMedia.id);
+        if (!existing) {
+          addToHistory({
+            ...playerMedia,
+            watchedAt: new Date().toISOString(),
+          });
+        }
+      } catch (e: any) {
+        if (!cancelled) {
+          setError(e.message || "Failed to load stream");
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
+    }
+
+    init();
+
+    return () => {
+      cancelled = true;
     };
-    loadDetail();
-    if (status === "authenticated" && session?.user) {
-      fetch("/api/watchlist").then((res) => res.json()).then((data) => {
-        if (cancelled) return;
-        const exists = data.watchlist?.some((item: any) => item.mediaId === selectedMedia.id && item.mediaType === selectedMedia.type);
-        setInWatchlist(!!exists);
-      }).catch(() => {});
-    }
-    fetch(`/api/ratings?mediaId=${selectedMedia.id}&mediaType=${selectedMedia.type}`).then((res) => res.json()).then((data) => {
-      if (cancelled) return;
-      setRatings(data.ratings || []); setUserRating(data.userRating || null);
-    }).catch(() => {});
-    fetch(`/api/comments?mediaId=${selectedMedia.id}&mediaType=${selectedMedia.type}`).then((res) => res.json()).then((data) => {
-      if (cancelled) return;
-      setComments(data.comments || []);
-    }).catch(() => {});
-    return () => { cancelled = true; };
-  }, [selectedMedia, session, status]);
+  }, [playerMedia]);
 
+  // FIX B: Refetch streamInfo + check manual subtitle saat ganti episode
   useEffect(() => {
-    if (!selectedMedia || selectedMedia.type !== "tv" || !detail) return;
+    if (!cinemacityData || !streamInfo) return;
+    if (cinemacityData.type !== "tv") return;
+    if (!currentSeason || !currentEpisode) return;
+
     let cancelled = false;
-    setEpisodesLoading(true);
-    fetch(`/api/season?id=${selectedMedia.id}&season=${season}`)
-      .then((res) => res.json()).then((data) => {
+
+    async function refetchSubtitles() {
+      try {
+        const freshInfo = await getStreamInfo(
+          cinemacityData.cinemacity_id,
+          currentSeason,
+          currentEpisode
+        );
         if (cancelled) return;
-        setEpisodes(data.episodes || []);
-      }).catch(() => {}).finally(() => { if (!cancelled) setEpisodesLoading(false); });
-    return () => { cancelled = true; };
-  }, [selectedMedia, detail, season]);
-
-  const handlePlay = (epNum?: number) => {
-    if (!selectedMedia) return;
-    const ep = epNum || episode;
-    if (epNum) setEpisode(epNum);
-    addToHistory({ ...selectedMedia, watchedAt: new Date().toISOString() });
-    openPlayer(selectedMedia, season, ep);
-  };
-
-  const handleToggleWatchlist = async () => {
-    if (!selectedMedia || !detail) return;
-    if (status !== "authenticated" || !session?.user) { setAuthModalOpen(true); toast.info("Silakan login dulu"); return; }
-    setWatchlistLoading(true);
-    try {
-      if (inWatchlist) {
-        const listRes = await fetch("/api/watchlist"); const listData = await listRes.json();
-        const item = listData.watchlist?.find((i: any) => i.mediaId === selectedMedia.id && i.mediaType === selectedMedia.type);
-        if (item) { await fetch(`/api/watchlist?id=${item.id}`, { method: "DELETE" }); setInWatchlist(false); toast.success("Dihapus dari watchlist"); }
-      } else {
-        const res = await fetch("/api/watchlist", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mediaId: selectedMedia.id, mediaType: selectedMedia.type, title: detail.title || detail.name || selectedMedia.title, posterPath: detail.poster_path, backdropPath: detail.backdrop_path }) });
-        if (res.ok) { setInWatchlist(true); toast.success("Ditambahkan ke watchlist"); }
+        setStreamInfo((prev) =>
+          prev
+            ? {
+                ...prev,
+                subtitles: freshInfo.subtitles,
+                episodes: freshInfo.episodes,
+              }
+            : freshInfo
+        );
+      } catch (e) {
+        console.error("Refetch subtitles failed:", e);
       }
-    } catch { toast.error("Terjadi kesalahan"); } finally { setWatchlistLoading(false); }
-  };
-
-  const handleRate = async (value: number) => {
-    if (!selectedMedia) return;
-    if (status !== "authenticated") { setAuthModalOpen(true); toast.info("Silakan login dulu"); return; }
-    setRatingLoading(true);
-    try {
-      const res = await fetch("/api/ratings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mediaId: selectedMedia.id, mediaType: selectedMedia.type, rating: value }) });
-      if (res.ok) { toast.success(value === 0 ? "Rating dihapus" : "Rating disimpan!"); const refresh = await fetch(`/api/ratings?mediaId=${selectedMedia.id}&mediaType=${selectedMedia.type}`); const data = await refresh.json(); setRatings(data.ratings || []); setUserRating(data.userRating || null); }
-    } catch { toast.error("Gagal menyimpan rating"); } finally { setRatingLoading(false); }
-  };
-
-  const handlePostComment = async () => {
-    if (!selectedMedia || !commentText.trim()) return;
-    if (status !== "authenticated") { setAuthModalOpen(true); return; }
-    setCommentLoading(true);
-    try {
-      const res = await fetch("/api/comments", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mediaId: selectedMedia.id, mediaType: selectedMedia.type, content: commentText }) });
-      if (res.ok) { setCommentText(""); toast.success("Komentar ditambahkan"); const refresh = await fetch(`/api/comments?mediaId=${selectedMedia.id}&mediaType=${selectedMedia.type}`); const data = await refresh.json(); setComments(data.comments || []); }
-    } catch { toast.error("Gagal menambahkan komentar"); } finally { setCommentLoading(false); }
-  };
-
-  const handlePostReply = async (parentId: string) => {
-    if (!selectedMedia || !replyText.trim()) return;
-    setCommentLoading(true);
-    try {
-      const res = await fetch("/api/comments", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mediaId: selectedMedia.id, mediaType: selectedMedia.type, content: replyText, parentId }) });
-      if (res.ok) { setReplyText(""); setReplyTo(null); toast.success("Reply ditambahkan"); const refresh = await fetch(`/api/comments?mediaId=${selectedMedia.id}&mediaType=${selectedMedia.type}`); const data = await refresh.json(); setComments(data.comments || []); }
-    } catch { toast.error("Gagal menambahkan reply"); } finally { setCommentLoading(false); }
-  };
-
-  const handleDeleteComment = async (id: string) => {
-    try { const res = await fetch(`/api/comments?id=${id}`, { method: "DELETE" }); if (res.ok) { toast.success("Komentar dihapus"); setComments((prev) => prev.filter((c) => c.id !== id)); } } catch { toast.error("Gagal menghapus"); }
-  };
-
-  const handleShare = () => {
-    if (!selectedMedia) return;
-    const shareUrl = `${window.location.origin}/?${selectedMedia.type}=${selectedMedia.id}`;
-    const shareTitle = detail?.title || detail?.name || selectedMedia.title || "CineStream";
-    if (navigator.share) {
-      navigator.share({ title: shareTitle, text: `Tonton ${shareTitle} di CineStream!`, url: shareUrl }).catch(() => {});
-    } else {
-      navigator.clipboard.writeText(shareUrl);
-      toast.success("Link film disalin ke clipboard!");
     }
+
+    refetchSubtitles();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentSeason, currentEpisode]);
+
+  // FIX B: Check manual subtitle saat streamInfo berubah atau episode berubah
+  useEffect(() => {
+    if (!streamInfo?.content?.title) {
+      setManualSubtitle(null);
+      return;
+    }
+
+    let cancelled = false;
+
+    async function checkManual() {
+      const manual = await checkManualSubtitle(
+        streamInfo!.content.title,
+        streamInfo!.content.type,
+        currentSeason || undefined,
+        currentEpisode || undefined
+      );
+      if (cancelled) return;
+      setManualSubtitle(manual);
+    }
+
+    checkManual();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streamInfo, currentSeason, currentEpisode]);
+
+  const streamUrl = useMemo(() => {
+    if (!cinemacityData || !streamInfo) return "";
+
+    const params = new URLSearchParams();
+    params.set("slug", cinemacityData.slug);
+    params.set("type", cinemacityData.type);
+
+    if (cinemacityData.type === "tv" && currentSeason && currentEpisode) {
+      params.set("season", currentSeason);
+      params.set("episode", currentEpisode);
+    }
+
+    if (currentServer !== "" && streamInfo.servers?.length > 1) {
+      params.set("server", currentServer);
+    }
+
+    return `${VPS_API_BASE}/api/stream/play/${cinemacityData.cinemacity_id}?${params.toString()}`;
+  }, [cinemacityData, streamInfo, currentSeason, currentEpisode, currentServer]);
+
+  const handleSwitchingChange = useCallback((isSwitching: boolean) => {
+    setSwitching(isSwitching);
+  }, []);
+
+  const handlePlayerError = useCallback((msg: string) => {
+    setError(msg);
+    setSwitching(false);
+  }, []);
+
+  const handleServerChange = (serverId: string) => {
+    setError(null);
+    setCurrentServer(serverId);
   };
 
-  if (!selectedMedia) return null;
+  const handleEpisodeChange = (episode: string) => {
+    setError(null);
+    setCurrentEpisode(episode);
+  };
 
-  const title = detail?.title || detail?.name || selectedMedia.title;
-  const year = (detail?.release_date || detail?.first_air_date || "").split("-")[0];
-  const tmdbRating = detail?.vote_average?.toFixed(1) || "N/A";
-  const runtime = detail?.runtime || detail?.episode_run_time?.[0];
-  const director = detail?.credits?.crew?.find((c) => c.job === "Director")?.name;
-  const creator = detail?.created_by?.[0]?.name;
-  const cast = detail?.credits?.cast?.slice(0, 12) || [];
-  const trailer = detail?.videos?.results?.find((v) => v.site === "YouTube" && v.type === "Trailer");
-  const similar = detail?.recommendations?.results?.slice(0, 12) || [];
-  const avgUserRating = ratings.length > 0 ? (ratings.reduce((sum, r) => sum + r.rating, 0) / ratings.length).toFixed(1) : null;
-  const isTV = selectedMedia.type === "tv";
+  const handleSeasonChange = (season: string) => {
+    setError(null);
+    setCurrentSeason(season);
+    const firstEp = episodes.find((e) => String(e.season) === season);
+    if (firstEp) setCurrentEpisode(String(firstEp.episode));
+  };
 
-  const logo = (detail as any)?.images?.logos?.find((l: any) => l.iso_639_1 === "en")
-    || (detail as any)?.images?.logos?.[0]
-    || null;
+  const episodes = streamInfo?.episodes || [];
+  const vpsSubtitles = streamInfo?.subtitles || [];
+  const servers = streamInfo?.servers || [];
+
+  // FIX B: Combine manual subtitle (PRIORITY) + VPS subtitles
+  // Manual subtitle selalu di index 0, jadi jadi default
+  const subtitles: SubtitleTrack[] = useMemo(() => {
+    const combined: SubtitleTrack[] = [];
+
+    if (manualSubtitle) {
+      combined.push(manualSubtitle);
+    }
+
+    vpsSubtitles.forEach((s) => {
+      const isIndo =
+        s.name.toLowerCase().includes("indonesia") ||
+        s.name.toLowerCase().includes("malay");
+      combined.push({
+        name: s.name + (manualSubtitle ? "" : ""),
+        url: `${VPS_API_BASE}/api/subtitle?url=${encodeURIComponent(s.url)}`,
+        isManual: false,
+        isIndo,
+      });
+    });
+
+    return combined;
+  }, [manualSubtitle, vpsSubtitles]);
+
+  const seasons = useMemo(() => {
+    const set = new Set<string>();
+    episodes.forEach((e) => set.add(String(e.season)));
+    return Array.from(set).sort((a, b) => Number(a) - Number(b));
+  }, [episodes]);
+
+  const currentSeasonEpisodes = useMemo(() => {
+    return episodes.filter((e) => String(e.season) === currentSeason);
+  }, [episodes, currentSeason]);
+
+  const currentEpisodeIdx = useMemo(() => {
+    return currentSeasonEpisodes.findIndex(
+      (e) => String(e.episode) === currentEpisode
+    );
+  }, [currentSeasonEpisodes, currentEpisode]);
+
+  const hasMultipleServers = servers.length > 1;
+
+  // FIX B: Default subtitle - kalau ada manual, pakai manual (idx 0)
+  // Kalau tidak, prefer Indonesia, fallback English Full, fallback pertama
+  const defaultSubtitleIdx = useMemo(() => {
+    if (subtitles.length === 0) return -1;
+    if (manualSubtitle) return 0; // Manual selalu default
+
+    const indoIdx = subtitles.findIndex(
+      (s) => s.isIndo
+    );
+    if (indoIdx >= 0) return indoIdx;
+
+    const englishFullIdx = subtitles.findIndex(
+      (s) =>
+        s.name.toLowerCase().includes("english") &&
+        s.name.toLowerCase().includes("full")
+    );
+    if (englishFullIdx >= 0) return englishFullIdx;
+
+    return 0;
+  }, [subtitles, manualSubtitle]);
+
+  if (!playerMedia) return null;
+
+  const isTV = cinemacityData?.type === "tv" && episodes.length > 0;
 
   return (
-    <Dialog open={!!selectedMedia} onOpenChange={(open) => { if (!open) setSelectedMedia(null); }}>
-      <DialogContent
-        className="flex flex-col gap-0 overflow-hidden p-0 max-w-[95vw] sm:max-w-2xl md:max-w-4xl lg:max-w-6xl"
-        style={{
-          height: "calc(100dvh - 2rem)",
-          maxHeight: "calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 1rem)",
-          marginTop: "env(safe-area-inset-top)",
-          marginBottom: "env(safe-area-inset-bottom)",
-          borderRadius: "12px",
-        }}
-      >
-        <DialogHeader className="sr-only"><DialogTitle>{title}</DialogTitle></DialogHeader>
+    <Dialog open={!!playerMedia} onOpenChange={(open) => !open && closePlayer()}>
+      <DialogContent className="max-w-[95vw] overflow-hidden rounded-xl border-0 bg-black p-0 md:max-w-5xl">
+        <DialogTitle className="sr-only">{playerMedia.title}</DialogTitle>
 
         <button
-          onClick={() => setSelectedMedia(null)}
-          className="absolute right-3 top-3 z-50 flex h-9 w-9 items-center justify-center rounded-full bg-black/80 text-white backdrop-blur-sm transition-colors hover:bg-primary"
+          onClick={closePlayer}
+          className="absolute right-2 top-2 z-30 flex h-8 w-8 items-center justify-center rounded-full bg-black/50 text-white opacity-0 backdrop-blur-sm transition-all hover:bg-red-600 hover:opacity-100 focus:opacity-100"
           aria-label="Close"
         >
           <X className="h-4 w-4" />
         </button>
 
-        <div className="flex-1 overflow-y-auto overflow-x-hidden">
-          {loading ? (
-            <div className="flex h-96 items-center justify-center"><Loader2 className="h-8 w-8 animate-spin text-primary" /></div>
-          ) : error ? (
-            <div className="flex h-96 flex-col items-center justify-center gap-3 p-6 text-center"><p className="text-sm text-destructive">{error}</p><Button variant="secondary" size="sm" onClick={() => setSelectedMedia(null)}>Go back</Button></div>
-          ) : detail ? (
-            <div className="fade-in pb-16">
-              <div className="relative h-[22vh] min-h-[140px] w-full overflow-hidden bg-muted sm:h-[30vh] md:aspect-video md:h-auto">
-                {detail.backdrop_path && (
-                  <Image
-                    src={getImageUrl(detail.backdrop_path, "original")}
-                    alt={title}
-                    fill
-                    sizes="(max-width: 768px) 100vw, 1024px"
-                    className="object-cover"
-                    unoptimized
-                    priority
-                  />
-                )}
-                <div className="absolute inset-0 bg-gradient-to-t from-card via-card/30 to-transparent" />
-                <div className="absolute inset-0 bg-gradient-to-r from-card/80 via-transparent to-transparent" />
-                <div className="absolute bottom-0 left-0 right-0 p-3 pr-12 sm:p-6 md:p-8">
-                  <Badge className="mb-1 bg-primary text-primary-foreground sm:mb-2">{isTV ? "TV Series" : "Movie"}</Badge>
-                  {logo ? (
-                    <div className="relative h-10 w-auto max-w-[75%] sm:h-14 md:h-20 md:max-w-[60%]">
-                      <Image
-                        src={getImageUrl(logo.file_path, "w500")}
-                        alt={title}
-                        fill
-                        className="object-contain object-left-bottom drop-shadow-lg"
-                        unoptimized
-                        sizes="(max-width: 768px) 75vw, 500px"
-                      />
-                    </div>
-                  ) : (
-                    <h2 className="text-lg font-extrabold tracking-tight text-white drop-shadow-lg sm:text-2xl md:text-4xl">
-                      {title}
-                    </h2>
-                  )}
-                  {detail.tagline && (
-                    <p className="mt-0.5 truncate text-[10px] italic text-white/80 sm:text-sm">
-                      &quot;{detail.tagline}&quot;
-                    </p>
-                  )}
-                </div>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2 border-b border-border bg-card/50 px-4 py-3 sm:gap-3 sm:px-6 md:px-8">
-                <Button size="sm" onClick={() => handlePlay()} className="gap-2 bg-primary text-primary-foreground hover:bg-primary/90 sm:size-lg">
-                  <Play className="h-4 w-4 fill-current" /><span className="text-xs sm:text-sm">Play</span>
-                </Button>
-                {trailer && (
-                  <a href={`https://www.youtube.com/watch?v=${trailer.key}`} target="_blank" rel="noopener noreferrer">
-                    <Button size="sm" variant="secondary" className="gap-2 sm:size-lg">
-                      <Play className="h-3 w-3 sm:h-4 sm:w-4" /><span className="text-xs sm:text-sm">Trailer</span>
-                    </Button>
-                  </a>
-                )}
-                <Button size="icon" variant="outline" onClick={handleToggleWatchlist} disabled={watchlistLoading} className={inWatchlist ? "border-primary text-primary" : ""}>
-                  {watchlistLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : inWatchlist ? <Check className="h-4 w-4" /> : <Bookmark className="h-4 w-4" />}
-                </Button>
-                <Button size="icon" variant="outline" aria-label="Share" onClick={handleShare}>
-                  <Share2 className="h-4 w-4" />
-                </Button>
-              </div>
-
-              {isTV && detail?.seasons && (
-                <div className="border-b border-border bg-card/30 px-4 py-3 sm:px-6 md:px-8">
-                  <div className="mb-3 flex items-center gap-2">
-                    <Select value={String(season)} onValueChange={(v) => { setSeason(parseInt(v, 10)); setEpisode(1); }}>
-                      <SelectTrigger className="h-8 w-28 shrink-0 text-xs"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        {detail.seasons.filter((s) => s.season_number > 0).map((s) => (
-                          <SelectItem key={s.id} value={String(s.season_number)}>S{s.season_number}</SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    <span className="ml-auto text-[10px] text-muted-foreground">EP {episode}</span>
-                    <div className="flex gap-1">
-                      <Button size="icon" variant="ghost" className="h-8 w-8" disabled={episode <= 1} onClick={() => setEpisode(Math.max(1, episode - 1))}>
-                        <ChevronLeft className="h-4 w-4" />
-                      </Button>
-                      <Button size="icon" variant="ghost" className="h-8 w-8" onClick={() => setEpisode(episode + 1)}>
-                        <ChevronRight className="h-4 w-4" />
-                      </Button>
-                    </div>
-                  </div>
-                  {episodesLoading ? (
-                    <div className="flex h-24 items-center justify-center"><Loader2 className="h-5 w-5 animate-spin text-primary" /></div>
-                  ) : episodes.length > 0 ? (
-                    <div className="overflow-x-auto pb-1" style={{ scrollbarWidth: "none", WebkitOverflowScrolling: "touch" }}>
-                      <div className="flex gap-2">
-                        {episodes.map((ep) => (
-                          <button
-                            key={ep.episodeNumber}
-                            onClick={() => handlePlay(ep.episodeNumber)}
-                            className={`relative aspect-video w-28 shrink-0 overflow-hidden rounded-lg border-2 transition-all sm:w-36 ${episode === ep.episodeNumber ? "border-primary" : "border-transparent hover:border-border"}`}
-                          >
-                            {ep.stillPath ? (
-                              <Image src={getImageUrl(ep.stillPath, "w300")} alt={`Ep ${ep.episodeNumber}`} fill sizes="144px" className="object-cover" unoptimized />
-                            ) : (
-                              <div className="flex h-full items-center justify-center bg-muted"><span className="text-[10px] text-muted-foreground">No Img</span></div>
-                            )}
-                            <div className="absolute inset-0 bg-gradient-to-t from-black/90 to-transparent" />
-                            <div className="absolute bottom-1 left-1 right-1">
-                              <p className="truncate text-[9px] font-bold text-white">EP {ep.episodeNumber}</p>
-                              <p className="truncate text-[8px] text-white/70">{ep.name}</p>
-                            </div>
-                            <div className="absolute inset-0 flex items-center justify-center bg-black/30 opacity-0 transition-opacity hover:opacity-100">
-                              <div className="flex h-7 w-7 items-center justify-center rounded-full bg-primary"><Play className="h-3 w-3 fill-white text-white" /></div>
-                            </div>
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  ) : null}
-                </div>
-              )}
-
-              <div className="grid gap-4 p-4 sm:gap-6 sm:p-6 md:grid-cols-3 md:p-8">
-                <div className="min-w-0 md:col-span-2">
-                  <div className="mb-3 flex flex-wrap items-center gap-2 text-xs sm:mb-4 sm:gap-3 sm:text-sm">
-                    <span className="flex items-center gap-1">
-                      <Star className="h-3.5 w-3.5 fill-yellow-400 text-yellow-400 sm:h-4 sm:w-4" />
-                      <span className="font-semibold">{tmdbRating}</span>
-                      <span className="text-muted-foreground">TMDB</span>
-                    </span>
-                    {avgUserRating && (
-                      <span className="flex items-center gap-1 text-primary">
-                        <Star className="h-3.5 w-3.5 fill-primary text-primary sm:h-4 sm:w-4" />
-                        <span className="font-semibold">{avgUserRating}</span>
-                        <span className="text-muted-foreground">User</span>
-                      </span>
-                    )}
-                    {year && (
-                      <span className="flex items-center gap-1 text-muted-foreground">
-                        <Calendar className="h-3.5 w-3.5 sm:h-4 sm:w-4" />{year}
-                      </span>
-                    )}
-                    {runtime && (
-                      <span className="flex items-center gap-1 text-muted-foreground">
-                        <Clock className="h-3.5 w-3.5 sm:h-4 sm:w-4" />{runtime}m
-                      </span>
-                    )}
-                    {detail.status && <Badge variant="secondary" className="text-xs">{detail.status}</Badge>}
-                  </div>
-
-                  {detail.genres && detail.genres.length > 0 && (
-                    <div className="mb-3 flex flex-wrap gap-1.5 sm:mb-4">
-                      {detail.genres.map((g) => <Badge key={g.id} variant="outline" className="text-xs">{g.name}</Badge>)}
-                    </div>
-                  )}
-
-                  <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground sm:mb-2 sm:text-sm">Overview</h3>
-                  <p className="break-words text-xs leading-relaxed text-foreground/90 sm:text-sm md:text-base">
-                    {detail.overview || "No overview available."}
-                  </p>
-
-                  {cast.length > 0 && (
-                    <div className="mt-4 sm:mt-6">
-                      <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground sm:mb-3 sm:text-sm">
-                        Top Cast
-                      </h3>
-                      <div
-                        className="overflow-x-auto pb-2"
-                        style={{ scrollbarWidth: "none", WebkitOverflowScrolling: "touch" }}
-                      >
-                        <style>{`div::-webkit-scrollbar { display: none; }`}</style>
-                        <div className="flex gap-3">
-                          {cast.map((p) => (
-                            <button
-                              key={p.id}
-                              onClick={() => handlePersonClick(p.id)}
-                              className="shrink-0 w-20 text-center sm:w-24 group"
-                            >
-                              <div className="relative mx-auto mb-2 h-20 w-20 overflow-hidden rounded-full bg-muted sm:h-24 sm:w-24 ring-2 ring-transparent transition-all group-hover:ring-primary">
-                                {p.profile_path ? (
-                                  <Image
-                                    src={getImageUrl(p.profile_path, "w185")}
-                                    alt={p.name}
-                                    fill
-                                    sizes="96px"
-                                    className="object-cover"
-                                    unoptimized
-                                  />
-                                ) : (
-                                  <div className="flex h-full items-center justify-center text-muted-foreground">
-                                    <UserIcon className="h-8 w-8" />
-                                  </div>
-                                )}
-                              </div>
-                              <p className="truncate text-[11px] font-medium text-foreground group-hover:text-primary sm:text-xs">{p.name}</p>
-                              <p className="truncate text-[9px] text-muted-foreground sm:text-[10px]">{p.character}</p>
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
-                  )}
-
-                  <div className="mt-6 border-t border-border pt-4">
-                    <h3 className="mb-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground sm:text-sm">
-                      Rate This {isTV ? "Series" : "Movie"}
-                    </h3>
-                    <div className="flex items-center gap-1">
-                      {[1,2,3,4,5].map((star) => {
-                        const value = star * 2;
-                        const isActive = (hoverRating || userRating?.rating || 0) >= value;
-                        return (
-                          <button
-                            key={star}
-                            onClick={() => handleRate(value)}
-                            onMouseEnter={() => setHoverRating(value)}
-                            onMouseLeave={() => setHoverRating(0)}
-                            disabled={ratingLoading}
-                            className="transition-transform hover:scale-110 disabled:opacity-50"
-                          >
-                            <Star className={isActive ? "h-6 w-6 fill-yellow-400 text-yellow-400 sm:h-7 sm:w-7" : "h-6 w-6 text-muted-foreground sm:h-7 sm:w-7"} />
-                          </button>
-                        );
-                      })}
-                      <span className="ml-3 text-sm font-medium">
-                        {ratingLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : userRating ? <span className="text-primary">{userRating.rating}/10</span> : <span className="text-muted-foreground">Click to rate</span>}
-                      </span>
-                    </div>
-                    {userRating && <Button variant="ghost" size="sm" onClick={() => handleRate(0)} className="mt-2 text-xs text-muted-foreground hover:text-destructive">Hapus rating</Button>}
-                  </div>
-                </div>
-
-                <div className="min-w-0 space-y-3 sm:space-y-4">
-                  {(director || creator) && (
-                    <div className="overflow-hidden">
-                      <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{isTV ? "Creator" : "Director"}</h4>
-                      <p className="mt-0.5 break-words text-xs sm:text-sm">{director || creator}</p>
-                    </div>
-                  )}
-                  {isTV && detail.number_of_seasons && (
-                    <div className="flex gap-4">
-                      <div>
-                        <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Seasons</h4>
-                        <p className="mt-0.5 text-xs sm:text-sm">{detail.number_of_seasons}</p>
-                      </div>
-                      <div>
-                        <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Episodes</h4>
-                        <p className="mt-0.5 text-xs sm:text-sm">{detail.number_of_episodes}</p>
-                      </div>
-                    </div>
-                  )}
-                  {detail.spoken_languages && detail.spoken_languages.length > 0 && (
-                    <div className="overflow-hidden">
-                      <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Languages</h4>
-                      <p className="mt-0.5 break-words text-xs sm:text-sm">{detail.spoken_languages.map((l) => l.english_name).join(", ")}</p>
-                    </div>
-                  )}
-                  {detail.production_companies && detail.production_companies.length > 0 && (
-                    <div className="overflow-hidden">
-                      <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Production</h4>
-                      <p className="mt-0.5 break-words text-xs sm:text-sm">{detail.production_companies.map((c) => c.name).join(", ")}</p>
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              {similar.length > 0 && (
-                <div className="border-t border-border py-4 sm:py-6">
-                  <h3 className="mb-3 px-4 text-sm font-bold sm:mb-4 sm:px-6 sm:text-base md:px-8">More Like This</h3>
-                  <div className="overflow-x-auto px-4 pb-2 sm:px-6 lg:px-8" style={{ scrollbarWidth: "none", WebkitOverflowScrolling: "touch" }}>
-                    <div className="flex gap-3">
-                      {similar.map((m) => <div key={`sim-${m.id}`} className="shrink-0"><MovieCard movie={m} size="sm" /></div>)}
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              <div className="border-t border-border px-4 py-4 pb-12 sm:px-6 sm:py-6 md:px-8">
-                <h3 className="mb-3 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground sm:text-sm">
-                  <MessageSquare className="h-4 w-4" />Comments ({comments.length})
-                </h3>
-                <div className="mb-4 flex gap-2">
-                  <Avatar className="h-8 w-8 shrink-0">
-                    <AvatarImage src={session?.user?.image || undefined} />
-                    <AvatarFallback className="bg-primary/20 text-xs text-primary">{session?.user?.name?.[0]?.toUpperCase() || "U"}</AvatarFallback>
-                  </Avatar>
-                  <div className="min-w-0 flex-1">
-                    <textarea
-                      value={commentText}
-                      onChange={(e) => setCommentText(e.target.value)}
-                      placeholder={status === "authenticated" ? "Tulis komentar..." : "Login untuk berkomentar"}
-                      disabled={status !== "authenticated"}
-                      className="w-full resize-none rounded-lg border border-border bg-transparent px-3 py-2 text-sm outline-none placeholder:text-muted-foreground focus:border-primary disabled:opacity-50"
-                      rows={2}
-                      maxLength={2000}
-                    />
-                    {status === "authenticated" && (
-                      <Button size="sm" onClick={handlePostComment} disabled={!commentText.trim() || commentLoading} className="mt-2 gap-1.5">
-                        {commentLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}Post
-                      </Button>
-                    )}
-                  </div>
-                </div>
-                <div className="max-h-[300px] space-y-3 overflow-y-auto pr-1" style={{ scrollbarWidth: "thin", WebkitOverflowScrolling: "touch" }}>
-                  {comments.length === 0 ? (
-                    <p className="py-4 text-center text-xs text-muted-foreground">Belum ada komentar. Jadilah yang pertama!</p>
-                  ) : (
-                    comments.map((c) => (
-                      <CommentNode
-                        key={c.id}
-                        comment={c}
-                        currentUserId={session?.user?.id}
-                        onReply={(id: string) => { setReplyTo(id); setReplyText(""); }}
-                        replyTo={replyTo}
-                        replyText={replyText}
-                        setReplyText={setReplyText}
-                        onPostReply={handlePostReply}
-                        onDelete={handleDeleteComment}
-                        commentLoading={commentLoading}
-                        level={0}
-                      />
-                    ))
-                  )}
-                </div>
-              </div>
+        {loading && (
+          <div className="flex aspect-video items-center justify-center bg-black">
+            <div className="flex flex-col items-center gap-3">
+              <Loader2 className="h-10 w-10 animate-spin text-primary" />
+              <p className="text-sm text-white/70">Loading stream...</p>
             </div>
-          ) : null}
-        </div>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function CommentNode({ comment, currentUserId, onReply, replyTo, replyText, setReplyText, onPostReply, onDelete, commentLoading, level }: any) {
-  const initial = comment.userName?.[0]?.toUpperCase() || "U";
-  const timeAgo = new Date(comment.createdAt).toLocaleDateString("id-ID", { day: "numeric", month: "short", year: "numeric" });
-  const isOwner = currentUserId === comment.userId;
-  return (
-    <div className={level > 0 ? "ml-6 border-l border-border pl-3" : ""}>
-      <div className="flex gap-2">
-        <Avatar className="h-8 w-8 shrink-0">
-          <AvatarImage src={comment.userImage || undefined} />
-          <AvatarFallback className="bg-primary/20 text-xs text-primary">{initial}</AvatarFallback>
-        </Avatar>
-        <div className="min-w-0 flex-1">
-          <div className="rounded-lg bg-muted/40 px-3 py-2">
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-xs font-semibold">{comment.userName || "Anonymous"}</span>
-              <span className="text-[10px] text-muted-foreground">{timeAgo}</span>
-            </div>
-            <p className="mt-1 break-words text-xs leading-relaxed sm:text-sm">{comment.content}</p>
           </div>
-          <div className="mt-1 flex items-center gap-3 px-1">
-            <button onClick={() => onReply(comment.id)} className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-primary">
-              <CornerDownRight className="h-3 w-3" />Reply
-            </button>
-            {isOwner && (
-              <button onClick={() => onDelete(comment.id)} className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-destructive">
-                <Trash2 className="h-3 w-3" />Delete
-              </button>
+        )}
+
+        {error && !loading && (
+          <div className="flex aspect-video flex-col items-center justify-center gap-3 bg-black p-6 text-center">
+            <AlertCircle className="h-10 w-10 text-red-500" />
+            <p className="text-sm text-white/90">{error}</p>
+            <div className="flex gap-2">
+              <Button variant="secondary" size="sm" onClick={closePlayer}>
+                Close
+              </Button>
+              {hasMultipleServers && (
+                <Button
+                  variant="default"
+                  size="sm"
+                  onClick={() => {
+                    setError(null);
+                    const next = (parseInt(currentServer || "0") + 1) % servers.length;
+                    handleServerChange(String(next));
+                  }}
+                >
+                  Coba Server Lain
+                </Button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {!loading && !error && streamUrl && (
+          <div className="relative aspect-video w-full bg-black">
+            <VideoPlayer
+              key={`${streamUrl}-${mountKey}`}
+              streamUrl={streamUrl}
+              subtitles={subtitles}
+              defaultSubtitleIdx={defaultSubtitleIdx}
+              onSwitchingChange={handleSwitchingChange}
+              onError={handlePlayerError}
+            />
+
+            {switching && (
+              <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+                <div className="flex flex-col items-center gap-2">
+                  <Loader2 className="h-8 w-8 animate-spin text-white" />
+                  <p className="text-xs text-white/70">Loading...</p>
+                </div>
+              </div>
             )}
           </div>
-          {replyTo === comment.id && (
-            <div className="mt-2 flex gap-2">
-              <textarea
-                value={replyText}
-                onChange={(e) => setReplyText(e.target.value)}
-                placeholder={`Reply to ${comment.userName || "user"}...`}
-                className="flex-1 resize-none rounded-lg border border-border bg-transparent px-3 py-2 text-xs outline-none focus:border-primary"
-                rows={2}
-                maxLength={2000}
-                autoFocus
-              />
-              <Button size="sm" onClick={() => onPostReply(comment.id)} disabled={!replyText.trim() || commentLoading} className="gap-1 self-end">
-                {commentLoading ? <Loader2 className="h-3 w-3 animate-spin" /> : <Send className="h-3 w-3" />}
-              </Button>
+        )}
+
+        {/* Server Selector */}
+        {!loading && !error && hasMultipleServers && (
+          <div className="flex flex-wrap items-center gap-2 border-t border-white/10 bg-zinc-950 p-3">
+            <span className="flex items-center gap-1 text-xs font-medium text-white/60">
+              <Server className="h-3 w-3" /> Server:
+            </span>
+            <Select value={currentServer} onValueChange={handleServerChange}>
+              <SelectTrigger className="h-8 w-full max-w-xs shrink-0 border-white/20 bg-zinc-900 text-xs text-white sm:w-72">
+                <SelectValue placeholder="Pilih server" />
+              </SelectTrigger>
+              <SelectContent>
+                {servers.map((srv) => (
+                  <SelectItem
+                    key={srv.id}
+                    value={String(srv.id)}
+                    className="text-xs"
+                  >
+                    {srv.title}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <span className="ml-auto text-[10px] text-white/40">
+              {servers.length} server tersedia
+            </span>
+          </div>
+        )}
+
+        {/* TV Episode Controls */}
+        {!loading && !error && isTV && (
+          <div className="flex flex-wrap items-center gap-2 border-t border-white/10 bg-zinc-950 p-3">
+            {seasons.length > 1 && (
+              <Select value={currentSeason} onValueChange={handleSeasonChange}>
+                <SelectTrigger className="h-8 w-24 shrink-0 border-white/20 bg-zinc-900 text-xs text-white">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {seasons.map((s) => (
+                    <SelectItem key={s} value={s} className="text-xs">
+                      Season {s}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+
+            {seasons.length === 1 && (
+              <span className="rounded-md bg-zinc-900 px-3 py-1.5 text-xs font-medium text-white/80">
+                Season {currentSeason}
+              </span>
+            )}
+
+            <Select value={currentEpisode} onValueChange={handleEpisodeChange}>
+              <SelectTrigger className="h-8 w-40 shrink-0 border-white/20 bg-zinc-900 text-xs text-white sm:w-52">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {currentSeasonEpisodes.map((ep) => (
+                  <SelectItem
+                    key={ep.episode}
+                    value={String(ep.episode)}
+                    className="text-xs"
+                  >
+                    E{ep.episode} — {ep.title}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
+            <span className="ml-auto text-[10px] text-white/50">
+              {currentEpisodeIdx + 1} / {currentSeasonEpisodes.length}
+            </span>
+            <div className="flex gap-1">
+              <button
+                onClick={() =>
+                  currentEpisodeIdx > 0 &&
+                  handleEpisodeChange(
+                    String(currentSeasonEpisodes[currentEpisodeIdx - 1].episode)
+                  )
+                }
+                disabled={currentEpisodeIdx <= 0}
+                className="flex h-8 items-center justify-center rounded-md bg-zinc-900 px-3 text-xs text-white/80 transition-colors hover:bg-zinc-800 disabled:opacity-30"
+              >
+                ← Prev
+              </button>
+              <button
+                onClick={() =>
+                  currentEpisodeIdx < currentSeasonEpisodes.length - 1 &&
+                  handleEpisodeChange(
+                    String(currentSeasonEpisodes[currentEpisodeIdx + 1].episode)
+                  )
+                }
+                disabled={currentEpisodeIdx >= currentSeasonEpisodes.length - 1}
+                className="flex h-8 items-center justify-center rounded-md bg-zinc-900 px-3 text-xs text-white/80 transition-colors hover:bg-zinc-800 disabled:opacity-30"
+              >
+                Next →
+              </button>
             </div>
-          )}
-        </div>
-      </div>
-      {comment.replies && comment.replies.length > 0 && (
-        <div className="mt-3 space-y-3">
-          {comment.replies.map((r: any) => (
-            <CommentNode
-              key={r.id}
-              comment={r}
-              currentUserId={currentUserId}
-              onReply={onReply}
-              replyTo={replyTo}
-              replyText={replyText}
-              setReplyText={setReplyText}
-              onPostReply={onPostReply}
-              onDelete={onDelete}
-              commentLoading={commentLoading}
-              level={level + 1}
-            />
-          ))}
-        </div>
-      )}
-    </div>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }
